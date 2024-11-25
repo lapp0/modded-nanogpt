@@ -6,6 +6,7 @@ import uuid
 import glob
 import time
 from dataclasses import dataclass
+import math
 
 import numpy as np
 import torch
@@ -193,6 +194,98 @@ class CausalSelfAttention(nn.Module):
         y = self.c_proj(y)
         return y, v1
 
+
+class DiffAttention(nn.Module):
+    """Adapted from https://github.com/microsoft/unilm/blob/master/Diff-Transformer/multihead_flashdiff_1.py"""
+    def __init__(self, config, lambda_init_depth=1):
+        super().__init__()
+        self.n_diff_head = config.n_head * 2
+        self.n_embd = config.n_embd
+        assert self.n_embd % self.n_diff_head == 0
+
+        # num_heads set to half of Transformer's #heads
+        self.diff_head_dim = self.n_embd // self.n_diff_head
+
+        self.q_proj = CastedLinear(self.n_embd, self.n_embd, bias=False)
+        self.k_proj = CastedLinear(self.n_embd, self.n_embd, bias=False)
+        self.v_proj = CastedLinear(self.n_embd, self.n_embd, bias=False)
+        self.out_proj = CastedLinear(self.n_embd, self.n_embd, bias=False)
+
+        self.rotary = Rotary(self.diff_head_dim)
+
+        # value residual weight
+        self.v_res_lamb = nn.Parameter(torch.tensor(0.5))  # @Grad62304977
+
+        # diff attention weights
+        self.lambda_init = 0.8 - 0.6 * math.exp(-0.3 * lambda_init_depth)
+        self.lambda_q1 = nn.Parameter(torch.zeros(self.diff_head_dim, dtype=torch.float32).normal_(mean=0,std=0.1))
+        self.lambda_k1 = nn.Parameter(torch.zeros(self.diff_head_dim, dtype=torch.float32).normal_(mean=0,std=0.1))
+        self.lambda_q2 = nn.Parameter(torch.zeros(self.diff_head_dim, dtype=torch.float32).normal_(mean=0,std=0.1))
+        self.lambda_k2 = nn.Parameter(torch.zeros(self.diff_head_dim, dtype=torch.float32).normal_(mean=0,std=0.1))
+
+
+        # TODO: unilm uses `from apex.normalization import FusedRMSNorm as RMSNorm`, is this rmsnorm better?
+        self.subln = nn.RMSNorm(2 * self.diff_head_dim, eps=1e-5, elementwise_affine=True)
+
+    def apply_attn(self, q, k, v, block_mask):
+        q_t, k_t, v_t = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
+        attn_out = flex_attention(q_t, k_t, v_t, block_mask=block_mask)
+        attn_out = attn_out.transpose(1, 2).contiguous()
+        return attn_out
+
+    def forward(self, x, residual_v0, block_mask):
+        bsz, tgt_len, embed_dim = x.size()
+
+        q = self.q_proj(x)
+        k = self.k_proj(x)
+        v = self.v_proj(x)
+
+        # Reshape projections
+        q = q.view(bsz, tgt_len, self.n_diff_head, self.diff_head_dim)
+        k = k.view(bsz, tgt_len, self.n_diff_head, self.diff_head_dim)
+
+        # calculate layer 0 v projection, and apply for all future layers - @Grad62304977
+        if residual_v0 is None:
+            residual_v0 = v
+        v = (1 - self.v_res_lamb) * v + self.v_res_lamb * residual_v0
+
+        # Apply rotary embeddings
+        cos, sin = self.rotary(q)
+        q, k = F.rms_norm(q, (q.size(-1),)), F.rms_norm(k, (k.size(-1),))  # QK norm suggested by @Grad62304977
+        q, k = apply_rotary_emb(q, cos, sin), apply_rotary_emb(k, cos, sin)
+
+        # Split diff heads
+        q = q.reshape(bsz, tgt_len, self.n_diff_head // 2, 2, self.diff_head_dim)
+        k = k.reshape(bsz, tgt_len, self.n_diff_head // 2, 2, self.diff_head_dim)
+        v = v.view(bsz, tgt_len, self.n_diff_head // 2, 2, self.diff_head_dim)
+        q1, q2 = q[:, :, :, 0], q[:, :, :, 1]
+        k1, k2 = k[:, :, :, 0], k[:, :, :, 1]
+        v1, v2 = v[:, :, :, 0], v[:, :, :, 1]
+
+        # Compute attention outputs
+        attn11 = self.apply_attn(q1, k1, v1, block_mask=block_mask)
+        attn12 = self.apply_attn(q1, k1, v2, block_mask=block_mask)
+        attn1 = torch.cat([attn11, attn12], dim=-1)
+
+        attn21 = self.apply_attn(q2, k2, v1, block_mask=block_mask)
+        attn22 = self.apply_attn(q2, k2, v2, block_mask=block_mask)
+        attn2 = torch.cat([attn21, attn22], dim=-1)
+
+        # Compute lambda_full
+        lambda_1 = torch.exp(torch.sum(self.lambda_q1 * self.lambda_k1, dim=-1).float()).type_as(q)
+        lambda_2 = torch.exp(torch.sum(self.lambda_q2 * self.lambda_k2, dim=-1).float()).type_as(q)
+        lambda_full = lambda_1 - lambda_2 + self.lambda_init
+        attn = attn1 - lambda_full * attn2
+
+        # Combine attention outputs
+        attn = self.subln(attn)
+        attn = attn * (1 - self.lambda_init)
+        attn = attn.reshape(bsz, tgt_len, self.n_diff_head * self.diff_head_dim)
+
+        attn = self.out_proj(attn)
+        return attn, residual_v0
+
+
 class MLP(nn.Module):
 
     def __init__(self, config):
@@ -211,16 +304,16 @@ class Block(nn.Module):
 
     def __init__(self, config):
         super().__init__()
-        self.attn = CausalSelfAttention(config)
+        self.attn = DiffAttention(config)
         self.mlp = MLP(config)
         self.lambdas = nn.Parameter(torch.tensor([1., 0.]))
 
-    def forward(self, x, v1, x0, block_mask):
-        x = self.lambdas[0] * x + self.lambdas[1] * x0
-        x1, v1 = self.attn(F.rms_norm(x, (x.size(-1),)), v1, block_mask)
+    def forward(self, x, residual_v_layer0, residual_input_embed, block_mask):
+        x = self.lambdas[0] * x + self.lambdas[1] * residual_input_embed
+        x1, residual_v_layer0 = self.attn(F.rms_norm(x, (x.size(-1),)), residual_v_layer0, block_mask)
         x = x + x1
         x = x + self.mlp(F.rms_norm(x, (x.size(-1),)))
-        return x, v1
+        return x, residual_v_layer0
 
 # -----------------------------------------------------------------------------
 # The main GPT-2 model
@@ -229,7 +322,7 @@ class Block(nn.Module):
 class GPTConfig:
     vocab_size : int = 50304
     n_layer : int = 12
-    n_head : int = 6 # head dim 128 suggested by @Grad62304977
+    n_head : int = 6  # head dim 128 suggested by @Grad62304977
     n_embd : int = 768
 
 class GPT(nn.Module):
