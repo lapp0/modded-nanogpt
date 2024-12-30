@@ -43,7 +43,7 @@ def zeropower_via_newtonschulz5(G, steps):
         A = X @ X.T
         B = b * A + c * A @ A # adapted from suggestion by @jxbz, @leloykun, and @YouJiacheng
         X = a * X + B @ X
-    
+
     if G.size(0) > G.size(1):
         X = X.T
     return X
@@ -70,26 +70,13 @@ class Muon(torch.optim.Optimizer):
         lr: The learning rate used by the internal SGD.
         momentum: The momentum used by the internal SGD.
         nesterov: Whether to use Nesterov-style momentum in the internal SGD. (recommended)
-        ns_steps: The number of Newton-Schulz iteration steps to use.
+        backend: The chosen backend for the orthogonalization step. (recommended: 'newtonschulz5')
+        backend_steps: The number of iteration steps to use in the backend, if it is iterative.
     """
-    def __init__(self, params, lr=0.02, momentum=0.95, nesterov=True, ns_steps=5):
-        self.world_size = int(os.environ['WORLD_SIZE'])
-        self.rank = int(os.environ['RANK'])
-        defaults = dict(lr=lr, momentum=momentum, nesterov=nesterov, ns_steps=ns_steps)
-        params = list(params)
-        assert all(isinstance(p, torch.Tensor) for p in params)
-        sizes = {p.numel() for p in params}
-        param_groups = [
-            {
-                'params': [p for p in params if p.numel() == size],
-                'update_buffer': [
-                    torch.empty(size, device='cuda', dtype=torch.bfloat16)
-                    for _ in range(self.world_size)
-                ],
-            }
-            for size in sizes
-        ]
-        super().__init__(param_groups, defaults)
+    def __init__(self, params, lr=0.02, momentum=0.95, nesterov=True,
+                 backend='newtonschulz5', backend_steps=5):
+        defaults = dict(lr=lr, momentum=momentum, nesterov=nesterov, backend=backend, backend_steps=backend_steps)
+        super().__init__(params, defaults)
 
     def step(self):
 
@@ -97,39 +84,36 @@ class Muon(torch.optim.Optimizer):
 
             lr = group['lr']
             momentum = group['momentum']
-            nesterov = group['nesterov']
-            ns_steps = group['ns_steps']
-            update_buffers = group['update_buffer']
+
             # generate weight updates in distributed fashion
-            params = group['params']
-            assert len(params) % self.world_size == 0
-            handle = None
-            params_world = None
-            def update_prev():
-                if params_world is None:
-                    return
-                assert handle is not None
-                handle.wait()
-                for p_world, g_world in zip(params_world, update_buffers):
-                    p_world.data.add_(
-                        g_world.view_as(p_world),
-                        alpha=-lr * max(1, p_world.size(0) / p_world.size(1)) ** 0.5,
-                    )
-            for base_i in range(len(params))[::self.world_size]:
-                p = params[base_i + self.rank]
-                g = p.grad
-                assert g is not None
-                state = self.state[p]
-                if 'momentum_buffer' not in state:
-                    state['momentum_buffer'] = torch.zeros_like(g)
-                buf = state['momentum_buffer']
-                buf.lerp_(g, 1 - momentum)
-                g = g.lerp_(buf, momentum) if nesterov else buf
-                g = zeropower_via_newtonschulz5(g, steps=ns_steps).flatten()
-                update_prev()
-                handle = dist.all_gather(update_buffers, g, async_op=True)
-                params_world = params[base_i : base_i + self.world_size]
-            update_prev()
+            total_params = sum(p.numel() for p in group['params'])
+            updates_flat = torch.zeros(total_params, device='cuda', dtype=torch.bfloat16)
+            curr_idx = 0
+            for i, p in enumerate(group['params']):
+                # luckily this will perfectly distribute a transformer with multiple of 4 layers to 8 GPUs
+                if i % int(os.environ['WORLD_SIZE']) == int(os.environ['RANK']):
+                    g = p.grad
+                    assert g is not None
+                    state = self.state[p]
+                    if 'momentum_buffer' not in state:
+                        state['momentum_buffer'] = torch.zeros_like(g)
+                    buf = state['momentum_buffer']
+                    buf.mul_(momentum).add_(g)
+                    g = g.add(buf, alpha=momentum) if group['nesterov'] else buf
+                    g = zeropower_via_newtonschulz5(g, steps=group['backend_steps'])
+                    g *= max(1, g.size(0)/g.size(1))**0.5
+                    updates_flat[curr_idx:curr_idx+p.numel()] = g.flatten()
+                curr_idx += p.numel()
+
+            # sync updates across devices. we are not memory-constrained so can do this simple deserialization
+            dist.all_reduce(updates_flat, op=dist.ReduceOp.SUM)
+
+            # deserialize and apply updates
+            curr_idx = 0
+            for p in group['params']:
+                g = updates_flat[curr_idx:curr_idx+p.numel()].view_as(p.data).type_as(p.data)
+                p.data.add_(g, alpha=-lr)
+                curr_idx += p.numel()
 
 # -----------------------------------------------------------------------------
 # PyTorch nn.Module definitions for the GPT-2 model
@@ -238,6 +222,32 @@ class ValueEmbedding(nn.Module):
         ve += reversed(ve)
         return ve
 
+
+class MTP(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.block = Block(config)
+        self.block.lambdas.data = torch.tensor([0.5, 0.5])
+        self.lm_head = CastedLinear(config.model_dim, config.vocab_size)
+
+    def forward(self, x, x0, block_mask, docs, targets, shift):
+        shifted_targets = torch.roll(targets, shifts=-shift, dims=0)
+        shifted_targets[-shift:] = -100
+        shifted_targets[:-shift][docs[:-shift] != docs[shift:]] = -100
+        shifted_x0 = torch.roll(x0, shifts=-shift, dims=1)
+
+        x = self.block(x, torch.zeros_like(x), shifted_x0, block_mask)
+
+        x = norm(x)
+        mtp_logits = self.lm_head(x)
+        mtp_logits = 30 * torch.tanh(mtp_logits / 30) # @Grad62304977
+        mtp_logits = mtp_logits.float()
+        mtp_loss = F.cross_entropy(mtp_logits.view(-1, mtp_logits.size(-1)), shifted_targets.view(-1), ignore_index=-100)
+
+        return mtp_loss, x
+
+
+
 # -----------------------------------------------------------------------------
 # The main GPT-2 model
 
@@ -247,6 +257,7 @@ class GPTConfig:
     num_layers : int = 12
     num_heads : int = 6 # head dim 128 suggested by @Grad62304977
     model_dim : int = 768
+    num_mtp_blocks: int = 1  # MTP per https://github.com/deepseek-ai/DeepSeek-V3/blob/main/DeepSeek_V3.pdf
 
 class GPT(nn.Module):
 
@@ -268,11 +279,18 @@ class GPT(nn.Module):
         self.lm_head = CastedLinear(config.model_dim, config.vocab_size)
         self.lm_head.weight.data.zero_() # @Grad62304977
 
+        # MTP
+        self.mtp_blocks = nn.ModuleList([MTP(config) for _ in range(config.num_mtp_blocks)])
+        for mtp_block in self.mtp_blocks:
+            mtp_block.lm_head.weight = self.lm_head.weight
+        self.mtp_factor = 0.1
+
     def forward(
         self,
         inputs: torch.Tensor,
         targets: torch.Tensor,
         sliding_window_num_blocks: torch.Tensor,
+        calc_mtp: bool = True
     ):
         BLOCK_SIZE = 128
         seq_len = len(inputs)
@@ -342,6 +360,14 @@ class GPT(nn.Module):
         logits = 30 * torch.tanh(logits / 30) # @Grad62304977
         logits = logits.float()
         loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
+
+        if not calc_mtp:
+            return loss
+
+        loss *= (1 - self.mtp_factor)
+        for i in range(len(self.mtp_blocks)):
+            mtp_loss, x = self.mtp_blocks[i](x, x0, block_mask, docs, targets, shift=i+1)
+            loss += mtp_loss * self.mtp_factor / len(self.mtp_blocks)
         return loss
 
 # -----------------------------------------------------------------------------
@@ -495,13 +521,21 @@ raw_model = model.module # always contains the "raw" unwrapped model
 # init the optimizer(s)
 embed_params = [*raw_model.embed.parameters(), *raw_model.value_embeds.parameters()]
 optimizer1 = torch.optim.Adam(embed_params, lr=0.6, betas=(0.8, 0.95), fused=True)
-optimizer2 = torch.optim.Adam([raw_model.lm_head.weight], lr=0.008, betas=(0.8, 0.95), fused=True)
-params = list(raw_model.blocks.parameters())
-matrix_params = [p for p in params if p.ndim == 2]
-scalar_params = [p for p in params if p.ndim < 2] + [raw_model.skip_weights]
+lm_heads = [raw_model.lm_head.weight]
+optimizer2 = torch.optim.Adam(lm_heads, lr=0.008, betas=(0.8, 0.95), fused=True)
+block_params = (
+    list(raw_model.blocks.parameters()) +
+    [p for mtp_block in raw_model.mtp_blocks for p in mtp_block.block.parameters()]
+)
+matrix_params = [p for p in block_params if p.ndim == 2]
+scalar_params = [p for p in block_params if p.ndim < 2] + [raw_model.skip_weights]
 optimizer3 = Muon(matrix_params, lr=0.05, momentum=0.95)
 optimizer4 = torch.optim.Adam(scalar_params, lr=0.04, betas=(0.8, 0.95), fused=True)
 optimizers = [optimizer1, optimizer2, optimizer3, optimizer4]
+
+for name, p in raw_model.named_parameters():
+    assert id(p) in list(map(id, embed_params + lm_heads + matrix_params + scalar_params)), f"{name} excluded from optimizers"
+
 # learning rate decay scheduler (linear warmup and cooldown)
 def get_lr(it):
     assert it <= args.num_iterations
@@ -554,7 +588,7 @@ for step in range(args.num_iterations + 1):
         for _ in range(val_steps):
             with torch.no_grad():
                 inputs_val, targets_val = val_loader.next_batch()
-                val_loss += model(inputs_val, targets_val, sliding_window_num_blocks)
+                val_loss += model(inputs_val, targets_val, sliding_window_num_blocks, calc_mtp=False)
         dist.all_reduce(val_loss, op=dist.ReduceOp.AVG)
         val_loss /= val_steps
         # log val loss to console and to logfile
